@@ -1,93 +1,160 @@
 <?php
-
 require_once 'db.php';
 
-// Tắt báo lỗi hiển thị để không hỏng JSON khi nộp bài
+// Tắt báo lỗi hiển thị để không hỏng JSON khi nộp bài qua AJAX
 error_reporting(0);
 ini_set('display_errors', 0);
 
-$exam_id = isset($_GET['id']) ? (int)$_GET['id'] : 1;
-$user_id = 1; // ID người dùng mẫu (cần có trong bảng nguoi_dung)
+session_start(); 
 
-// --- XỬ LÝ NỘP BÀI (AJAX) ---
+// 1. Kiểm tra đăng nhập
+if (!isset($_SESSION['user_id'])) {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['status' => 'error', 'message' => 'Phiên đăng nhập hết hạn. Vui lòng đăng nhập lại!']);
+        exit;
+    }
+    header("Location: login.php");
+    exit;
+}
+
+$user_id = $_SESSION['user_id'];
+$exam_id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+
+if ($exam_id == 0 && $_SERVER['REQUEST_METHOD'] !== 'POST') {
+    die("Không tìm thấy mã đề thi.");
+}
+
+// --- XỬ LÝ NỘP BÀI (AJAX - SERVER SIDE SCORING) ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json; charset=utf-8');
     try {
         $input = json_decode(file_get_contents('php://input'), true);
-        if (!$input) throw new Exception("Không có dữ liệu.");
+        if (!$input) throw new Exception("Không có dữ liệu gửi lên.");
 
-        $score = $input['score'];
-        $correct_count = $input['correct_count'];
-        $details = $input['answers']; // Mảng câu trả lời: [{question_id: 1, selected: 'A'}, ...]
+        // Nhận danh sách câu trả lời của user
+        $userAnswers = $input['answers']; // Dạng: [{question_id: 1, selected: 'A'}, ...]
 
         $conn->beginTransaction();
 
-        // 1. Lưu vào bảng 'lich_su_lam_bai'
-        // Lưu ý: bảng của bạn có cột 'ten_bai_thi', ta lấy tạm tên từ client hoặc query thêm
+        // A. Lấy thông tin đề thi và ĐÁP ÁN ĐÚNG từ database (Để tính điểm tại server)
+        // Chỉ lấy những câu hỏi thuộc đề thi này
+        $sqlKey = "SELECT ch.id, ch.dapAn 
+                   FROM cau_hoi ch
+                   JOIN bai_thi_cau_hoi btch ON ch.id = btch.cau_hoi_id
+                   WHERE btch.bai_thi_id = :eid";
+        $stmtKey = $conn->prepare($sqlKey);
+        $stmtKey->execute([':eid' => $exam_id]);
+        $correctAnswersMap = $stmtKey->fetchAll(PDO::FETCH_KEY_PAIR); // Tạo mảng dạng [id_cau_hoi => dap_an_dung]
+
+        if (empty($correctAnswersMap)) throw new Exception("Đề thi không tồn tại hoặc không có câu hỏi.");
+
+        // Lấy tên đề thi
         $stmtName = $conn->prepare("SELECT tieu_de FROM bai_thi WHERE id = :id");
         $stmtName->execute([':id' => $exam_id]);
         $examTitle = $stmtName->fetchColumn();
 
+        // B. Tính điểm (Logic bảo mật)
+        $totalQuestions = count($correctAnswersMap);
+        $correctCount = 0;
+        $detailsToSave = [];
+
+        // Duyệt qua từng câu trả lời của user
+        foreach ($userAnswers as $ans) {
+            $qid = $ans['question_id'];
+            $selected = $ans['selected'];
+            
+            // Mặc định là sai
+            $isCorrect = 0;
+
+            // Kiểm tra: Nếu câu hỏi có trong đề thi VÀ đáp án user chọn trùng khớp đáp án DB
+            if (isset($correctAnswersMap[$qid]) && $correctAnswersMap[$qid] === $selected) {
+                $isCorrect = 1;
+                $correctCount++;
+            }
+
+            // Chuẩn bị dữ liệu để lưu chi tiết
+            $detailsToSave[] = [
+                'qid' => $qid,
+                'selected' => $selected,
+                'is_correct' => $isCorrect
+            ];
+        }
+
+        // Tính điểm thang 10
+        $finalScore = ($totalQuestions > 0) ? ($correctCount / $totalQuestions) * 10 : 0;
+        $finalScore = round($finalScore, 2); // Làm tròn 2 chữ số thập phân
+
+        // C. Lưu vào bảng lich_su_lam_bai
         $sqlHistory = "INSERT INTO lich_su_lam_bai (nguoi_dung_id, bai_thi_id, ten_bai_thi, diem_so, thoi_gian_bat_dau, thoi_gian_ket_thuc) 
-                       VALUES (:uid, :eid, :title, :score, NOW(), NOW())"; // Tạm thời start/end giống nhau
+                       VALUES (:uid, :eid, :title, :score, NOW(), NOW())";
         $stmtHis = $conn->prepare($sqlHistory);
         $stmtHis->execute([
             ':uid' => $user_id,
             ':eid' => $exam_id,
             ':title' => $examTitle,
-            ':score' => $score
+            ':score' => $finalScore
         ]);
         $history_id = $conn->lastInsertId();
 
-        // 2. Lưu vào bảng 'chi_tiet_bai_lam'
+        // D. Lưu chi tiết từng câu (chi_tiet_bai_lam)
         $sqlDetail = "INSERT INTO chi_tiet_bai_lam (lich_su_id, cau_hoi_id, cau_tra_loi, dung_sai) 
                       VALUES (:ls_id, :qh_id, :ans, :is_correct)";
         $stmtDet = $conn->prepare($sqlDetail);
 
-        foreach ($details as $d) {
-            // Xác định đúng sai (Server check lại cho chắc hoặc tin Client)
-            // Ở đây mình nhận cờ is_correct từ client gửi lên cho nhanh (dựa vào logic JS bên dưới)
+        foreach ($detailsToSave as $d) {
             $stmtDet->execute([
                 ':ls_id' => $history_id,
-                ':qh_id' => $d['question_id'],
-                ':ans'   => $d['selected'], // Lưu 'A', 'B', 'C', hoặc 'D'
-                ':is_correct' => $d['is_correct'] ? 1 : 0
+                ':qh_id' => $d['qid'],
+                ':ans'   => $d['selected'], 
+                ':is_correct' => $d['is_correct']
             ]);
         }
 
         $conn->commit();
         echo json_encode(['status' => 'success', 'result_id' => $history_id]);
         exit;
+
     } catch (Exception $e) {
-        $conn->rollBack();
+        if ($conn->inTransaction()) $conn->rollBack();
         echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
         exit;
     }
 }
 
-// --- PHẦN HIỂN THỊ GIAO DIỆN (GET) ---
-ini_set('display_errors', 1); // Bật lại lỗi để debug giao diện
+// --- HIỂN THỊ GIAO DIỆN LÀM BÀI ---
+// Bật lại lỗi để debug HTML nếu cần (nhưng PHP render xong mới bật JS nên không ảnh hưởng JSON ở trên)
+ini_set('display_errors', 1);
 error_reporting(E_ALL);
 
-// 1. Lấy thông tin bài thi
+// 3. Lấy thông tin bài thi
 $stmtExam = $conn->prepare("SELECT * FROM bai_thi WHERE id = :id");
 $stmtExam->execute([':id' => $exam_id]);
 $examInfo = $stmtExam->fetch(PDO::FETCH_ASSOC);
 
-if (!$examInfo) die("Không tìm thấy bài thi!");
+if (!$examInfo) {
+    die("Đề thi không tồn tại hoặc đã bị xóa!");
+}
 
-// 2. Lấy câu hỏi từ bảng 'cau_hoi' thông qua bảng trung gian 'bai_thi_cau_hoi'
-$sqlQ = "SELECT ch.* FROM cau_hoi ch
+// 4. Lấy danh sách câu hỏi (UPDATED LOGIC)
+// - Dùng DISTINCT để tránh trùng lặp nếu lỡ DB có dữ liệu rác
+// - ORDER BY btch.thu_tu ASC để sắp xếp theo ý muốn của Admin
+$sqlQ = "SELECT DISTINCT ch.* FROM cau_hoi ch
          JOIN bai_thi_cau_hoi btch ON ch.id = btch.cau_hoi_id
-         WHERE btch.bai_thi_id = :eid";
+         WHERE btch.bai_thi_id = :eid
+         ORDER BY btch.thu_tu ASC, btch.cau_hoi_id ASC"; 
+         
 $stmtQ = $conn->prepare($sqlQ);
 $stmtQ->execute([':eid' => $exam_id]);
 $rawQuestions = $stmtQ->fetchAll(PDO::FETCH_ASSOC);
 
-// 3. Chuẩn hóa dữ liệu cho Javascript (Vì bảng của bạn là cauA, cauB... nên cần map lại thành mảng options)
+if (count($rawQuestions) == 0) {
+    die('<div class="text-center p-10">Đề thi này chưa được cập nhật câu hỏi. Vui lòng liên hệ Admin. <a href="index.php" class="text-blue-500">Quay lại</a></div>');
+}
+
+// Format dữ liệu cho JS
 $formattedQuestions = [];
 foreach ($rawQuestions as $row) {
-    // Tạo cấu trúc options giả lập để tái sử dụng giao diện cũ
     $options = [
         ['code' => 'A', 'content' => $row['cauA']],
         ['code' => 'B', 'content' => $row['cauB']],
@@ -95,12 +162,10 @@ foreach ($rawQuestions as $row) {
         ['code' => 'D', 'content' => $row['cauD']]
     ];
     
-    // Xáo trộn đáp án nếu muốn (ở đây mình giữ nguyên thứ tự A-B-C-D cho dễ)
-    
     $formattedQuestions[] = [
         'id' => $row['id'],
         'content' => $row['cauHoi'],
-        'correct_code' => $row['dapAn'], // Lưu đáp án đúng (A/B/C/D) để JS chấm
+        // KHÔNG gửi đáp án đúng (correct_code) xuống Client để tránh lộ đề khi F12
         'options' => $options
     ];
 }
@@ -131,10 +196,15 @@ $jsonData = json_encode(['info' => $examInfo, 'questions' => $formattedQuestions
 <body class="bg-slate-50 text-slate-800 h-screen flex flex-col overflow-hidden">
     <header class="bg-white/95 backdrop-blur-md shadow-sm border-b border-slate-100 h-16 flex-none z-50">
         <div class="container mx-auto px-4 h-full flex justify-between items-center">
-            <h1 class="font-serif font-bold text-lg text-brand-red truncate max-w-xs">
+            <a href="javascript:history.back()" class="text-slate-500 hover:text-brand-red mr-4">
+                <i class="fa-solid fa-arrow-left"></i>
+            </a>
+
+            <h1 class="font-serif font-bold text-lg text-brand-red truncate max-w-xs flex-grow">
                 <?php echo htmlspecialchars($examInfo['tieu_de']); ?>
             </h1>
-            <div class="glass-card px-4 py-1 rounded-full flex items-center gap-2 border-brand-red/20">
+            
+            <div class="glass-card px-4 py-1 rounded-full flex items-center gap-2 border-brand-red/20 mr-4">
                 <i class="fa-regular fa-clock text-brand-red"></i>
                 <span id="timer" class="font-mono font-bold text-xl text-slate-800">--:--</span>
             </div>
@@ -156,7 +226,7 @@ $jsonData = json_encode(['info' => $examInfo, 'questions' => $formattedQuestions
         <div class="hidden lg:flex w-1/4 flex-col h-full">
             <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 h-full flex flex-col">
                 <h3 class="font-bold text-slate-700 mb-4">Danh sách câu hỏi</h3>
-                <div class="flex-grow overflow-y-auto pr-2">
+                <div class="flex-grow overflow-y-auto pr-2 custom-scrollbar">
                     <div id="question-grid" class="grid grid-cols-5 gap-2"></div>
                 </div>
             </div>
@@ -169,11 +239,15 @@ $jsonData = json_encode(['info' => $examInfo, 'questions' => $formattedQuestions
         const examInfo = fullData.info;
 
         let currentQuestionIndex = 0;
-        let userAnswers = new Array(quizData.length).fill(null); // Lưu mã đáp án: 'A', 'B',...
+        let userAnswers = new Array(quizData.length).fill(null);
         let timeLeft = (examInfo.thoi_gian || 45) * 60; 
         let timerInterval;
 
         document.addEventListener('DOMContentLoaded', () => {
+            if(quizData.length === 0) {
+                alert('Đề thi này chưa có câu hỏi nào!');
+                return;
+            }
             renderGrid();
             loadQuestion(0);
             startTimer();
@@ -203,13 +277,12 @@ $jsonData = json_encode(['info' => $examInfo, 'questions' => $formattedQuestions
             let html = `
                 <div class="mb-6 animate-fade-in">
                     <span class="text-brand-red font-bold text-sm bg-red-50 px-3 py-1 rounded-full mb-3 inline-block">Câu ${index + 1}</span>
-                    <h3 class="text-xl font-serif font-bold text-slate-800">${q.content}</h3>
+                    <h3 class="text-xl font-serif font-bold text-slate-800 leading-snug">${q.content}</h3>
                 </div>
                 <div class="space-y-3 animate-fade-in">
             `;
 
             q.options.forEach(opt => {
-                // Kiểm tra xem đã chọn chưa (so sánh mã A,B,C,D)
                 const isSelected = userAnswers[index] === opt.code ? 'option-selected' : '';
                 html += `
                     <div onclick="selectAnswer(${index}, '${opt.code}')" 
@@ -227,7 +300,7 @@ $jsonData = json_encode(['info' => $examInfo, 'questions' => $formattedQuestions
         function selectAnswer(index, code) {
             userAnswers[index] = code;
             document.getElementById(`grid-item-${index}`).classList.add('answered');
-            loadQuestion(index); // Re-render để hiện màu chọn
+            loadQuestion(index);
             updateProgressBar();
         }
 
@@ -269,34 +342,32 @@ $jsonData = json_encode(['info' => $examInfo, 'questions' => $formattedQuestions
 
         function submitExam() {
             clearInterval(timerInterval);
-            let correct = 0;
+            
+            // UPDATE: Chỉ gom câu trả lời, KHÔNG tính điểm ở Client
             const details = [];
-
             quizData.forEach((q, i) => {
-                const choice = userAnswers[i]; // 'A', 'B' ... hoặc null
-                const isTrue = (choice === q.correct_code); // So sánh với đáp án đúng từ DB
-                if(isTrue) correct++;
-                
                 details.push({
                     question_id: q.id,
-                    selected: choice, // Gửi 'A', 'B'... lên server
-                    is_correct: isTrue
+                    selected: userAnswers[i] // Có thể là null nếu chưa làm
                 });
             });
 
-            const score = (correct / quizData.length) * 10;
-
+            // Gửi dữ liệu về Server để chấm điểm
             fetch('exam.php?id=<?php echo $exam_id; ?>', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ score, correct_count: correct, answers: details })
+                body: JSON.stringify({ answers: details }) 
             })
             .then(res => res.json())
             .then(data => {
-                if(data.status === 'success') window.location.href = `result.php?id=${data.result_id}`;
-                else alert('Lỗi: ' + data.message);
+                if(data.status === 'success') {
+                    // Chuyển hướng sang trang kết quả
+                    window.location.href = `result.php?id=${data.result_id}`;
+                } else {
+                    alert('Lỗi: ' + data.message);
+                }
             })
-            .catch(err => alert('Lỗi kết nối server'));
+            .catch(err => alert('Lỗi kết nối server: ' + err));
         }
     </script>
 </body>
